@@ -1,0 +1,478 @@
+﻿-- Метрики маркетплейса
+
+
+-- общая выручка за день и скользящее среднее выручки за 3 дня (2 предыдущих и текущий)
+WITH revenue_per_day AS (
+SELECT o.order_created_time::DATE AS order_date,
+SUM(oi.price) AS daily_revenue
+FROM order_items oi
+LEFT JOIN orders o USING(order_id)
+GROUP BY o.order_created_time::DATE)
+SELECT order_date, daily_revenue, 
+AVG(daily_revenue) OVER(ORDER BY order_date RANGE BETWEEN INTERVAL '2' DAY PRECEDING AND CURRENT ROW) 
+FROM revenue_per_day
+ORDER BY order_date
+
+
+-- по дате регистрации количество новых клиентов и накопительное количество клиентов
+-- в CTE: количество новых клиентов на каждую дату регистрации
+-- оконная функция для расчета общего количества клиентов (прирост регистраций)
+WITH count_customers AS  (
+SELECT created_at,
+                        count(customer_id) AS new_customers
+            FROM customers
+            GROUP BY created_at
+            ORDER BY created_at)
+SELECT *,
+(SUM(new_customers) OVER (ORDER BY created_at))::INTEGER as total_customers
+FROM count_customers
+
+
+-- DAU маркетплейса
+SELECT event_timestamp::DATE AS date,
+    COUNT(DISTINCT customer_id) AS DAU
+FROM customer_actions
+GROUP BY date
+
+
+-- метрика WAU
+SELECT DATE_TRUNC('week', event_timestamp)::DATE AS date,
+    COUNT(DISTINCT customer_id) AS WAU
+FROM customer_actions
+GROUP BY date
+-- вывод: DAU и WAU маркетплейса растут
+
+
+-- результат: таблица с метрики выручки, MAU, ARPPU по каждому месяцу
+-- меньше половины активной аудитории является платящей 
+-- выручка на платящего пользователя на стабильном уровне, без явно выраженного увеличения
+WITH mau AS (
+SELECT DATE_TRUNC('month', event_timestamp)::DATE AS date,
+    COUNT(DISTINCT customer_id) AS mau
+FROM customer_actions
+GROUP BY date)
+SELECT DATE_TRUNC('month', o.order_created_time)::DATE AS order_month,
+SUM(oi.price) AS monthly_revenue,
+m.mau,
+COUNT(DISTINCT o.customer_id) AS paying_users,
+SUM(oi.price) / COUNT(DISTINCT o.customer_id) AS arppu
+FROM order_items oi
+LEFT JOIN orders o USING(order_id)
+JOIN mau m 
+ON m.date = DATE_TRUNC('month', o.order_created_time)::DATE
+GROUP BY order_month, mau
+ORDER BY order_month
+
+
+-- недельный retention по дате регистрации (смотрю медианный retention по прошествию 1, 2 и т. д. недель)
+-- вывод: retention удерживается на плато 20-21%.
+WITH cohort_day AS (
+SELECT DISTINCT customer_id, 
+DATE_TRUNC('day', created_at)::DATE AS cohort_day
+FROM customers),
+later_activity AS (
+SELECT DISTINCT customer_id,
+DATE_TRUNC('day', event_timestamp)::DATE AS activity_day
+FROM customer_actions),
+days_of_activity AS (
+SELECT
+DATE_TRUNC('week', cd.cohort_day)::DATE AS cohort_week,
+(la.activity_day - cd.cohort_day) / 7 AS period_number_weeks,
+COUNT(DISTINCT la.customer_id) AS retained_users
+FROM cohort_day cd
+JOIN later_activity la
+USING (customer_id)
+GROUP BY cohort_week, period_number_weeks),
+size_of_cohort AS (
+SELECT DATE_TRUNC('week', cohort_day)::DATE AS cohort_week,
+COUNT (DISTINCT customer_id) AS cohort_users
+FROM cohort_day
+GROUP BY cohort_week)
+SELECT *,
+ROUND(100.0 * d.retained_users / s.cohort_users, 1) AS retention
+FROM days_of_activity d
+JOIN size_of_cohort s
+USING (cohort_month)
+SELECT d.period_number_weeks, 
+PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY (ROUND(100.0 * d.retained_users / s.cohort_users, 1))) AS median_retention
+FROM days_of_activity d
+JOIN size_of_cohort s
+USING (cohort_week)
+GROUP BY period_number_weeks
+
+
+-- месячный retention (в данных только январь-март 2024)
+-- вывод: в первый месяц retention когорты января – 67,8%, когорты февраля – 41,7%
+-- во второй месяц retention когорты января – 40,5%
+WITH cohort_day AS (
+SELECT DISTINCT customer_id, 
+DATE_TRUNC('day', created_at)::DATE AS cohort_day
+FROM customers),
+later_activity AS (
+SELECT DISTINCT customer_id,
+DATE_TRUNC('day', event_timestamp)::DATE AS activity_day
+FROM customer_actions),
+days_of_activity AS (
+SELECT
+DATE_TRUNC('month', cd.cohort_day)::DATE AS cohort_month,
+(la.activity_day - cd.cohort_day) / 30 AS period_number_months,
+COUNT(DISTINCT la.customer_id) AS retained_users
+FROM cohort_day cd
+JOIN later_activity la
+USING (customer_id)
+GROUP BY cohort_month, period_number_months),
+size_of_cohort AS (
+SELECT DATE_TRUNC('month', cohort_day)::DATE AS cohort_month,
+COUNT (DISTINCT customer_id) AS cohort_users
+FROM cohort_day
+GROUP BY cohort_month)
+SELECT *, 
+ROUND(100.0 * d.retained_users / s.cohort_users, 1) AS retention
+FROM days_of_activity d
+JOIN size_of_cohort s
+USING (cohort_month)
+
+
+-- общая воронка пользователей (с учетом порядка действий: просмотр –> корзина –> покупка)
+-- CTE №1: дату первого действия каждого типа в группировке по клиенту
+-- объединение с таблицей customers и получение даты заказа
+-- CTE №2: количество зарегистрированных пользователей, просмотров, добавлений в корзину и покупок при условии соблюдения порядка
+-- доля от предыдущего шага
+-- результат: 73,9% из зарегистрированных пользователей просматривают товары
+-- 94,2% добавляют товар в корзину, 45,8% из добавивших в корзину делают заказ
+WITH first_events AS (
+  SELECT c.customer_id,
+c.created_at,
+MIN(CASE WHEN ca.event_type = 'Page View' THEN ca.event_timestamp END) AS t_view,
+MIN(CASE WHEN ca.event_type = 'Add to Cart' THEN ca.event_timestamp END) AS t_cart,
+MIN(CASE WHEN ca.event_type = 'Purchase' THEN ca.event_timestamp END) AS t_purchase
+FROM customer_actions ca
+RIGHT JOIN customers c USING(customer_id)
+GROUP BY c.customer_id, c.created_at
+),
+count_in_order AS(
+SELECT
+COUNT (customer_id) AS total_customers,
+COUNT(*) FILTER (WHERE t_view IS NOT NULL) AS views,
+COUNT(*) FILTER (WHERE t_cart > t_view) AS cart_after_view,
+COUNT(*) FILTER (WHERE t_purchase > t_cart) AS purchase_after_cart
+FROM first_events)
+
+
+SELECT 
+    ROUND(100.0 * views/ total_customers, 2) AS registration_views,
+    ROUND(100.0 * cart_after_view/ views, 2) AS view_to_cart_cr,
+    ROUND(100.0 * purchase_after_cart / NULLIF(cart_after_view, 0), 2) AS cart_to_purchase_cr
+FROM count_in_order
+
+
+-- расчет доли покупок, добавлений в корзину от количества просмотров по товарам
+-- CTE №1:  количество просмотров и добавлений в корзину в группировке по товарам
+-- CTE №2: количество заказов товара (в таблице customer_actions не отображается product_id при покупке)
+-- расчет доли, объединение двух временных таблиц
+-- позволяет обратить внимание на товары, на которых сокращается добавление в корзину или покупки
+WITH events_not_purchase AS(
+SELECT 
+    product_id,
+    COUNT(product_id) FILTER (WHERE event_type = 'Page View') AS views,
+    COUNT(product_id) FILTER (WHERE event_type = 'Add to Cart') AS adds_cart
+FROM customer_actions
+GROUP BY product_id),
+events_purchase AS (
+SELECT 
+    oi.product_id,
+    COUNT(oi.product_id) FILTER (WHERE ca.event_type = 'Purchase') AS purchases
+FROM customer_actions ca
+JOIN order_items oi USING(order_id)
+GROUP BY oi.product_id)
+SELECT
+    np.product_id,
+    ROUND(100.0 * np.adds_cart/NULLIF(np.views, 0), 2) AS cart_to_views,
+    ROUND(100.0 * p.purchases/NULLIF(np.adds_cart, 0), 2) AS purchase_to_cart,
+    ROUND(100.0 * p.purchases/NULLIF(np.views, 0), 2) AS purchase_to_views
+FROM events_not_purchase np
+JOIN events_purchase p
+USING(product_id)
+ORDER BY purchase_to_views DESC
+
+
+-- Анализ продукции и цены
+
+
+-- ad hoc: сколько бы стоил товар после применения скидки в 5% или промокода в 100 рублей
+-- значения округляю вниз
+SELECT product_id,
+price,
+FLOOR(price*(1-0.05)) AS price_5_perc_discount,
+FLOOR(price-100) AS price_100_rub_discount
+FROM order_items
+ORDER BY product_id DESC, price DESC
+
+
+-- коэффициент ценовой вариации для товаров: насколько сильно колеблются цены
+-- выявляю топ-10 самых нестабильных товаров
+-- учитываю товары, которые продавались больше 1 раза
+SELECT product_id,
+ROUND((MAX(price) - MIN(price))/AVG(price), 3) AS price_variation_coefficient
+FROM order_items
+GROUP BY product_id
+HAVING COUNT(product_id) > 1
+ORDER BY price_variation_coefficient DESC
+LIMIT 10
+
+
+-- выявление премиальных брендов (с высокой стоимостью)
+-- средняя цена товаров выше общей средней цены всех товаров в магазине в 1,2 раза
+SELECT p.product_brand, 
+AVG(oi.price) AS brand_avg_price
+FROM products p
+JOIN order_items oi USING(product_id)
+GROUP BY p.product_brand
+HAVING AVG(oi.price) >= (SELECT avg(price) FROM order_items) * 1.20
+ORDER BY brand_avg_price DESC
+
+
+-- три самых дорогих товара в каждой товарной категории
+-- в итоге получаем топ по каждой категории с указанием цены, идентификатора и бренда
+WITH price_ranking AS(
+SELECT p.product_category_name, 
+p.product_id, p.product_brand, 
+oi.price,
+DENSE_RANK() OVER (PARTITION BY p.product_category_name ORDER BY oi.price DESC) as price_rank
+FROM order_items oi
+JOIN products p USING(product_id))
+SELECT *
+FROM price_ranking
+WHERE price_rank <= 3
+ORDER BY product_category_name
+
+
+-- выявление “премиальных” и “бюджетных” товаров внутри категории и бренда
+-- насколько отличаются от средней цены по категории и бренду
+SELECT DISTINCT p.product_id, 
+p.product_category_name, 
+p.product_brand, 
+oi.price,
+AVG(oi.price) OVER(PARTITION BY p.product_category_name) AS avg_category_price,
+AVG(oi.price) OVER(PARTITION BY p.product_brand) AS avg_brand_price,
+oi.price-AVG(oi.price) OVER(PARTITION BY p.product_category_name) AS category_price_delta,
+oi.price-AVG(oi.price) OVER(PARTITION BY p.product_brand) AS brand_price_delta
+FROM products p
+JOIN order_items oi USING(product_id)
+ORDER BY product_id, product_category_name, price, category_price_delta
+
+
+-- выгрузка топа-10 брендов по уровню выручки с топом-10 лидерами их продаж по категориям
+-- CTE, подзапросы в WHERE, оконные функции 
+WITH brand_revenue AS (
+SELECT p.product_brand,
+SUM(oi.price) AS rev_per_brand
+FROM products p
+JOIN order_items oi USING(product_id)
+GROUP BY p.product_brand
+ORDER BY rev_per_brand DESC
+LIMIT 10),
+category_revenue AS (
+SELECT p.product_brand,
+p.product_category_name,
+SUM(oi.price) AS rev_per_category,
+ROW_NUMBER () OVER (PARTITION BY p.product_brand ORDER BY SUM(oi.price) DESC) AS rank
+FROM products p
+JOIN order_items oi USING(product_id)
+WHERE p.product_brand IN (SELECT product_brand FROM brand_revenue)
+GROUP BY p.product_brand,
+p.product_category_name)
+SELECT 
+c.product_brand,
+c.product_category_name,
+c.rev_per_category,
+b.rev_per_brand
+FROM brand_revenue b
+JOIN category_revenue c USING(product_brand)
+WHERE rank <= 10
+
+
+-- Анализ аудитории
+
+
+-- количество уникальных клиентов, которые регистрировалось в системе каждый месяц
+SELECT 
+DATE_TRUNC('month', created_at) AS registration_month,
+COUNT(DISTINCT customer_id) AS unique_customers_count
+FROM customers
+GROUP BY registration_month
+ORDER BY registration_month DESC
+
+
+-- выгрузка клиентов, которые часто отменяют заказ
+SELECT customer_id, 
+COUNT(CASE WHEN order_status = 'Returned' THEN 1 END) AS returned_orders, COUNT(CASE WHEN order_status = 'Delivered' THEN 1 END) AS delivered_orders
+FROM orders
+GROUP BY customer_id
+ORDER BY customer_id ASC
+
+
+-- выгрузка клиентов, которые за все время сделали меньше 3-х заказов
+-- также смотрю на дату их последнего заказа
+-- сортировка по возрастанию customer_id
+SELECT c.customer_id, 
+c.customer_city, 
+MAX(o.order_created_time) AS last_order_date, 
+COUNT(DISTINCT o.order_id) AS total_orders
+FROM customers c
+LEFT JOIN orders o ON c.customer_id = o.customer_id
+WHERE o.order_created_time IS NOT NULL
+GROUP BY c.customer_id
+HAVING COUNT(DISTINCT o.order_id) < 3
+ORDER BY customer_id
+
+
+-- определяю статус клиента в зависимости от количества просмотров товара
+-- в CTE расчет количества просмотров по пользователю
+-- в теле запроса с помощью CASE 
+WITH pageviews_count AS (
+SELECT customer_id, COUNT(event_type) AS views_count
+FROM customer_actions
+WHERE event_type = 'Page View'
+GROUP BY customer_id)
+SELECT DISTINCT customer_id, views_count,
+CASE 
+WHEN customer_id IN (SELECT customer_id FROM pageviews_count WHERE views_count >= 40) THEN 'Активный'
+WHEN customer_id IN (SELECT customer_id FROM pageviews_count WHERE views_count BETWEEN 10 AND 39) THEN 'Средний'
+ELSE 'Новичок'
+END AS customer_status
+FROM pageviews_count
+ORDER BY views_count DESC, customer_id DESC
+
+
+-- разделяю всех активных клиентов на “старых” и “новых”
+-- первый заказ до 01.02.2024 - старые, а после - новые
+-- нужны клиенты, совершившие хотя бы один заказ (order_id IS NOT NULL)
+-- в CTE дата первого заказа по каждому клиенту
+WITH customer_first_order AS(
+SELECT customer_id,
+MIN(order_created_time) AS first_order_date
+FROM orders
+WHERE order_id IS NOT NULL
+GROUP BY customer_id) 
+SELECT customer_id, 
+first_order_date,
+CASE WHEN first_order_date < '2024-02-01'  THEN 'Старый клиент'
+ELSE 'Новый клиент'
+END AS customer_segment
+FROM customer_first_order
+ORDER BY first_order_date
+
+
+-- среднее время между первым и вторым заказом клиентов маркетплейса
+-- смотрю только клиентов, у которых есть второй заказ
+-- в CTE оконные функции LEAD и ROW_NUMBER
+-- окно по customer_id, сортировка по времени заказа
+-- итог: 7 дней 1 час 27 минут
+WITH all_orders AS (
+SELECT customer_id, 
+order_id, 
+order_created_time,
+ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY order_created_time) as order_number,
+LEAD(order_created_time, 1) OVER (PARTITION BY customer_id ORDER BY order_created_time) AS next_ordertime
+FROM orders) 
+SELECT
+AVG(next_ordertime-order_created_time) AS avg_time_between_1st_and_2nd_order
+FROM all_orders
+WHERE order_number = 1 AND next_ordertime IS NOT NULL
+
+
+-- выявляю клиентов, которые покупают товары из наибольшего числа различных категорий
+-- это клиенты-исследователи
+-- другие - это клиенты “специалисты”, интересуются только 1-2 категориями
+-- в CTE расчет количества уникальных категорий по клиенту
+-- во втором СTE оконная функция для присвоения ранга по количеству категорий
+-- фильтр оставляет только клиентов-специалистов (можно сделать другой фильтр)
+WITH count_categories AS (
+SELECT o.customer_id,  
+COUNT(DISTINCT p.product_category_name) AS distinct_categories_count
+FROM orders o
+JOIN order_items oi USING (order_id)
+JOIN products p USING(product_id)
+GROUP BY o.customer_id), 
+assign_rank AS (
+SELECT *,
+DENSE_RANK() OVER(ORDER BY distinct_categories_count DESC) AS diversity_rank
+FROM count_categories
+ORDER BY diversity_rank, customer_id)
+SELECT *
+FROM assign_rank
+WHERE distinct_categories_count = 1 OR distinct_categories_count = 2
+
+
+-- Заказы
+
+
+-- количество заказов по статусе в целом
+-- количество опоздавших заказов
+SELECT order_status, 
+COUNT(*) AS total_orders,
+COUNT(order_id) FILTER (WHERE order_delivered_customer_time > order_estimated_delivery_time) as late_orders
+FROM orders
+GROUP BY order_status
+
+
+-- доля опоздавших заказов по брендам и среднее количество дней опозданий
+-- за опоздание не рассматриваю доставку день в день, но с опозданием по времени
+-- проранжировала по доле опоздавших заказов и количеству дней опопздания
+WITH number_orders AS (
+SELECT p.product_brand, 
+COUNT(DISTINCT order_id) FILTER (WHERE o.order_delivered_customer_time::DATE - o.order_estimated_delivery_time::DATE > 0) AS delayed_orders,
+COUNT(DISTINCT order_id) AS total_orders,
+AVG(o.order_delivered_customer_time::DATE - o.order_estimated_delivery_time::DATE) FILTER (WHERE o.order_delivered_customer_time::DATE - o.order_estimated_delivery_time::DATE > 0) AS avg_days_of_delay
+FROM orders o
+JOIN order_items oi USING(order_id)
+JOIN products p USING(product_id)
+WHERE o.order_status = 'Delivered'
+GROUP BY product_brand)
+SELECT *,
+ROUND(100.0 * delayed_orders / total_orders, 1) AS delay_rate
+FROM number_orders
+ORDER BY delay_rate DESC, avg_days_of_delay DESC
+
+
+-- смотрю, какие бренды чаще всего были заказаны клиентами из Москвы
+-- схема объединения таблиц: customers -> orders -> order_items -> products
+SELECT p.product_brand, COUNT(oi.order_item_id) AS items_count 
+FROM customers c
+LEFT JOIN orders o ON c.customer_id = o.customer_id
+LEFT JOIN order_items oi ON o.order_id = oi.order_id
+LEFT JOIN products p ON oi.product_id = p.product_id
+WHERE customer_city = 'Москва' AND p.product_brand IS NOT NULL
+GROUP BY p.product_brand
+ORDER BY p.product_brand 
+
+
+-- доля отмененных заказов по городам
+-- объединение customers и orders с сохранением всех покупателей (LEFT JOIN)
+SELECT c.customer_city, COUNT(o.order_id) AS total_orders, 
+COUNT(CASE WHEN order_status = 'Returned' THEN 1 END) AS canceled_orders,
+ROUND((COUNT(CASE WHEN order_status = 'Returned' THEN 1 END) * 100.0/COUNT(o.order_id)), 2) AS cancel_rate_percent 
+FROM customers c
+LEFT JOIN orders o ON c.customer_id = o.customer_id
+GROUP BY c.customer_city
+ORDER BY cancel_rate_percent DESC
+
+
+-- расчет нарастающей суммы заказа каждого клиента
+-- в CTE расчет общей суммы по каждому заказу
+-- SUM при оконной функции дает нарастающую сумму заказа
+-- окно customer_id
+WITH total_price_count AS (
+SELECT order_id, 
+SUM(price) as order_total_price
+FROM order_items
+GROUP BY order_id) 
+SELECT o.customer_id, 
+o.order_id, 
+o.order_created_time, 
+tp.order_total_price,
+SUM(tp.order_total_price) OVER(PARTITION BY o.customer_id ORDER BY o.order_created_time) AS cumulative_spend
+FROM orders o --здесь уникальные значения order_id
+LEFT JOIN total_price_count tp USING(order_id)
+ORDER BY customer_id, order_created_time
