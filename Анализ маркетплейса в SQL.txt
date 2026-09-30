@@ -14,31 +14,41 @@ ORDER BY order_date
 
 
 -- по дате регистрации количество новых клиентов и накопительное количество клиентов
--- в CTE: количество новых клиентов на каждую дату регистрации
--- оконная функция для расчета общего количества клиентов (прирост регистраций)
-WITH count_customers AS  (
+-- в CTE 1: количество новых клиентов на каждую дату регистрации
+-- в CTE 2: расчет дневной активной аудитории (DAU)
+-- в CTE 3: оконная функция для расчета общего количества клиентов (прирост регистраций)
+-- JOIN CTE 2 и 3
+-- получаю таблицу одновременно с количеством зарегистрированных клиентов и активной аудиторией
+WITH count_customers AS (
 SELECT created_at,
-                        count(customer_id) AS new_customers
-            FROM customers
-            GROUP BY created_at
-            ORDER BY created_at)
-SELECT *,
-(SUM(new_customers) OVER (ORDER BY created_at))::INTEGER as total_customers
-FROM count_customers
-
-
--- DAU маркетплейса
-SELECT event_timestamp::DATE AS date,
-    COUNT(DISTINCT customer_id) AS DAU
-FROM customer_actions
-GROUP BY date
-
+        count(customer_id) AS new_customers
+    FROM customers
+    GROUP BY created_at
+    ORDER BY created_at),
+    dau AS (
+    SELECT 
+        event_timestamp::DATE AS date,
+        COUNT(DISTINCT customer_id) AS DAU
+    FROM customer_actions
+    GROUP BY date),
+    accumulating_number AS(
+    SELECT *,
+   	 (SUM(new_customers) OVER (ORDER BY created_at))::INTEGER as total_customers
+    FROM count_customers)
+    SELECT d.date,
+        a.new_customers,
+        a.total_customers,
+        d.dau
+    FROM accumulating_number a
+    JOIN dau d 
+    ON a.created_at = d.date
 
 -- метрика WAU
 SELECT DATE_TRUNC('week', event_timestamp)::DATE AS date,
     COUNT(DISTINCT customer_id) AS WAU
 FROM customer_actions
 GROUP BY date
+
 -- вывод: DAU и WAU маркетплейса растут
 
 
@@ -283,8 +293,8 @@ p.product_category_name)
 SELECT 
 c.product_brand,
 c.product_category_name,
-c.rev_per_category,
-b.rev_per_brand
+b.rev_per_brand,
+c.rev_per_category
 FROM brand_revenue b
 JOIN category_revenue c USING(product_brand)
 WHERE rank <= 10
