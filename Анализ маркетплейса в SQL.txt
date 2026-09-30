@@ -292,15 +292,6 @@ WHERE rank <= 10
 
 -- Анализ аудитории
 
--- количество уникальных клиентов, которые регистрировалось в системе каждый месяц
-SELECT 
-DATE_TRUNC('month', created_at) AS registration_month,
-COUNT(DISTINCT customer_id) AS unique_customers_count
-FROM customers
-GROUP BY registration_month
-ORDER BY registration_month DESC
-
-
 -- выгрузка клиентов, которые часто отменяют заказ
 SELECT customer_id, 
 COUNT(CASE WHEN order_status = 'Returned' THEN 1 END) AS returned_orders, COUNT(CASE WHEN order_status = 'Delivered' THEN 1 END) AS delivered_orders
