@@ -395,15 +395,6 @@ WHERE distinct_categories_count = 1 OR distinct_categories_count = 2
 
 -- Заказы
 
--- количество заказов по статусе в целом
--- количество опоздавших заказов
-SELECT order_status, 
-COUNT(*) AS total_orders,
-COUNT(order_id) FILTER (WHERE order_delivered_customer_time > order_estimated_delivery_time) as late_orders
-FROM orders
-GROUP BY order_status
-
-
 -- доля опоздавших заказов по брендам и среднее количество дней опозданий
 -- за опоздание не рассматриваю доставку день в день, но с опозданием по времени
 -- проранжировала по доле опоздавших заказов и количеству дней опопздания
