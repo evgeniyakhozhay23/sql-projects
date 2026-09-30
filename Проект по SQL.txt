@@ -274,7 +274,7 @@ category_revenue AS (
 SELECT p.product_brand,
 p.product_category_name,
 SUM(oi.price) AS rev_per_category,
-ROW_NUMBER () OVER (PARTITION BY p.product_brand ORDER BY SUM(oi.price) DESC) AS rank
+DENSE_RANK() OVER (PARTITION BY p.product_brand ORDER BY SUM(oi.price) DESC) AS rank
 FROM products p
 JOIN order_items oi USING(product_id)
 WHERE p.product_brand IN (SELECT product_brand FROM brand_revenue)
