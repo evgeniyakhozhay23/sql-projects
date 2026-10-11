@@ -76,32 +76,27 @@ ORDER BY order_month
 -- недельный retention по дате регистрации (смотрю медианный retention по прошествию 1, 2 и т. д. недель)
 -- вывод: retention удерживается на плато 20-21%.
 WITH cohort_day AS (
-SELECT DISTINCT customer_id, 
-DATE_TRUNC('day', created_at)::DATE AS cohort_day
-FROM customers),
+        SELECT DISTINCT customer_id, 
+        DATE_TRUNC('day', created_at)::DATE AS cohort_day
+        FROM customers),
 later_activity AS (
-SELECT DISTINCT customer_id,
-DATE_TRUNC('day', event_timestamp)::DATE AS activity_day
-FROM customer_actions),
+        SELECT DISTINCT customer_id,
+        DATE_TRUNC('day', event_timestamp)::DATE AS activity_day
+        FROM customer_actions),
 days_of_activity AS (
-SELECT
-DATE_TRUNC('week', cd.cohort_day)::DATE AS cohort_week,
-(la.activity_day - cd.cohort_day) / 7 AS period_number_weeks,
-COUNT(DISTINCT la.customer_id) AS retained_users
-FROM cohort_day cd
-JOIN later_activity la
-USING (customer_id)
-GROUP BY cohort_week, period_number_weeks),
+        SELECT
+        DATE_TRUNC('week', cd.cohort_day)::DATE AS cohort_week,
+        (la.activity_day - cd.cohort_day) / 7 AS period_number_weeks,
+        COUNT(DISTINCT la.customer_id) AS retained_users
+        FROM cohort_day cd
+        JOIN later_activity la
+        USING (customer_id)
+        GROUP BY cohort_week, period_number_weeks),
 size_of_cohort AS (
-SELECT DATE_TRUNC('week', cohort_day)::DATE AS cohort_week,
-COUNT (DISTINCT customer_id) AS cohort_users
-FROM cohort_day
-GROUP BY cohort_week)
-SELECT *,
-ROUND(100.0 * d.retained_users / s.cohort_users, 1) AS retention
-FROM days_of_activity d
-JOIN size_of_cohort s
-USING (cohort_month)
+        SELECT DATE_TRUNC('week', cohort_day)::DATE AS cohort_week,
+        COUNT (DISTINCT customer_id) AS cohort_users
+        FROM cohort_day
+        GROUP BY cohort_week)
 SELECT d.period_number_weeks, 
 PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY (ROUND(100.0 * d.retained_users / s.cohort_users, 1))) AS median_retention
 FROM days_of_activity d
@@ -114,27 +109,27 @@ GROUP BY period_number_weeks
 -- вывод: в первый месяц retention когорты января – 67,8%, когорты февраля – 41,7%
 -- во второй месяц retention когорты января – 40,5%
 WITH cohort_day AS (
-SELECT DISTINCT customer_id, 
-DATE_TRUNC('day', created_at)::DATE AS cohort_day
-FROM customers),
+        SELECT DISTINCT customer_id, 
+        DATE_TRUNC('day', created_at)::DATE AS cohort_day
+        FROM customers),
 later_activity AS (
-SELECT DISTINCT customer_id,
-DATE_TRUNC('day', event_timestamp)::DATE AS activity_day
-FROM customer_actions),
+        SELECT DISTINCT customer_id,
+        DATE_TRUNC('day', event_timestamp)::DATE AS activity_day
+        FROM customer_actions),
 days_of_activity AS (
-SELECT
-DATE_TRUNC('month', cd.cohort_day)::DATE AS cohort_month,
-(la.activity_day - cd.cohort_day) / 30 AS period_number_months,
-COUNT(DISTINCT la.customer_id) AS retained_users
-FROM cohort_day cd
-JOIN later_activity la
-USING (customer_id)
-GROUP BY cohort_month, period_number_months),
+        SELECT
+        DATE_TRUNC('month', cd.cohort_day)::DATE AS cohort_month,
+        (la.activity_day - cd.cohort_day) / 30 AS period_number_months,
+        COUNT(DISTINCT la.customer_id) AS retained_users
+        FROM cohort_day cd
+        JOIN later_activity la
+        USING (customer_id)
+        GROUP BY cohort_month, period_number_months),
 size_of_cohort AS (
-SELECT DATE_TRUNC('month', cohort_day)::DATE AS cohort_month,
-COUNT (DISTINCT customer_id) AS cohort_users
-FROM cohort_day
-GROUP BY cohort_month)
+        SELECT DATE_TRUNC('month', cohort_day)::DATE AS cohort_month,
+        COUNT (DISTINCT customer_id) AS cohort_users
+        FROM cohort_day
+        GROUP BY cohort_month)
 SELECT *, 
 ROUND(100.0 * d.retained_users / s.cohort_users, 1) AS retention
 FROM days_of_activity d
